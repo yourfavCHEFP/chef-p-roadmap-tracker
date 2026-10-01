@@ -1,0 +1,24 @@
+name: CHEF_P Daily Roadmap Reminder
+
+on:
+  schedule:
+    # 19:00 UTC = 8:00 PM WAT (Nigeria). Edit the hour if you want a
+    # different local time — GitHub Actions cron is always in UTC.
+    - cron: "0 19 * * *"
+  workflow_dispatch: {}  # lets you click "Run workflow" to test it manually
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - run: python daily_reminder.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GITHUB_TOKEN_PAT: ${{ secrets.GITHUB_TOKEN_PAT }}

@@ -9,6 +9,7 @@ import re
 import urllib.parse
 from datetime import date, timedelta
 
+import requests
 import streamlit as st
 import graphviz
 
@@ -280,7 +281,13 @@ def week_dates(i):
 # STATE (persisted to a JSON file next to the app)
 # ----------------------------------------------------------------------
 def default_week_state():
-    return {"status": "pending", "days": [False] * 7, "daily": "", "capstone": ""}
+    return {"status": "pending", "days": [False] * 7, "daily": "", "capstone": "", "last_touched": ""}
+
+
+def touch_week(wk):
+    """Stamp a week as edited today — this is what powers the 'did I make
+    progress today' check in the Today banner."""
+    wk["last_touched"] = date.today().isoformat()
 
 
 def _fill_defaults(weeks):
@@ -288,19 +295,22 @@ def _fill_defaults(weeks):
         key = str(w["id"])
         if key not in weeks:
             weeks[key] = default_week_state()
+        else:
+            weeks[key].setdefault("last_touched", "")
     return weeks
 
 
 def load_state():
     if USE_SUPABASE:
-        weeks = {}
+        weeks, log = {}, {}
         try:
             res = _supabase.table("chefp_roadmap").select("data").eq("id", _ROW_ID).execute()
             if res.data:
                 weeks = res.data[0]["data"].get("weeks", {})
+                log = res.data[0]["data"].get("engineering_log", {})
         except Exception as e:
             st.warning(f"Could not load saved state from Supabase ({e}). Starting fresh this session.")
-        return {"weeks": _fill_defaults(weeks)}
+        return {"weeks": _fill_defaults(weeks), "engineering_log": log}
     # local JSON fallback
     data = {}
     if os.path.exists(STATE_FILE):
@@ -309,7 +319,7 @@ def load_state():
                 data = json.load(f)
         except Exception:
             data = {}
-    return {"weeks": _fill_defaults(data.get("weeks", {}))}
+    return {"weeks": _fill_defaults(data.get("weeks", {})), "engineering_log": data.get("engineering_log", {})}
 
 
 def save_state(state):
@@ -327,6 +337,89 @@ if "state" not in st.session_state:
     st.session_state.state = load_state()
 
 state = st.session_state.state
+
+# ----------------------------------------------------------------------
+# GITHUB COMMIT STREAK
+# Reads your public push events for free, with no setup. Add GITHUB_TOKEN
+# to secrets (a personal access token, "repo" scope) if you want PRIVATE
+# repo commits counted too — without it, only public-repo pushes show.
+# Change GITHUB_USERNAME below if this isn't your GitHub handle.
+# ----------------------------------------------------------------------
+GITHUB_USERNAME = "yourfavCHEFP"
+GITHUB_TOKEN = _get_secret("GITHUB_TOKEN")
+
+
+@st.cache_data(ttl=300)
+def get_github_push_dates(username, token):
+    """Returns the set of ISO dates (UTC) on which at least one push event
+    happened, from GitHub's events API (last ~90 days / 300 events)."""
+    url = f"https://api.github.com/users/{username}/events" if token \
+        else f"https://api.github.com/users/{username}/events/public"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    dates = set()
+    try:
+        for page in (1, 2, 3):
+            resp = requests.get(url, headers=headers, params={"per_page": 100, "page": page}, timeout=6)
+            if resp.status_code != 200:
+                break
+            events = resp.json()
+            if not events:
+                break
+            for e in events:
+                if e.get("type") == "PushEvent":
+                    dates.add(e["created_at"][:10])  # "YYYY-MM-DD"
+            if len(events) < 100:
+                break
+    except Exception:
+        return None  # signals "couldn't check" vs. genuinely zero
+    return dates
+
+
+def compute_streak(push_dates):
+    if not push_dates:
+        return 0
+    streak = 0
+    d = date.today()
+    while d.isoformat() in push_dates:
+        streak += 1
+        d -= timedelta(days=1)
+    return streak
+
+
+# ----------------------------------------------------------------------
+# DAILY STUDY PLAN
+# Deterministic, rule-based split of a week's concepts + resources across
+# 7 days — no AI call, so it's free and instant. Order is preserved
+# (watch -> read -> practice) so nothing is assigned half-finished, and
+# each resource appears on exactly one day. Saturday is reserved for the
+# Engineering Log; Sunday is light review / catch-up.
+# ----------------------------------------------------------------------
+def build_daily_plan(concepts, resources):
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    plan = {d: {"concept": None, "resources": []} for d in days}
+    study_days = days[:5]  # Mon-Fri
+
+    for i, d in enumerate(study_days):
+        if concepts:
+            plan[d]["concept"] = concepts[i % len(concepts)]
+
+    # watch -> read -> practice, in that order, chunked evenly across
+    # Mon-Fri so each resource lands on exactly one day
+    ordered = [r for r in resources if r[0] in ("video", "course")] \
+        + [r for r in resources if r[0] in ("book", "paper")] \
+        + [r for r in resources if r[0] in ("repo", "doc", "note")]
+    n = len(ordered)
+    if n:
+        base, extra = divmod(n, 5)
+        idx = 0
+        for i, d in enumerate(study_days):
+            take = base + (1 if i < extra else 0)
+            plan[d]["resources"] = ordered[idx:idx + take]
+            idx += take
+
+    plan["Sat"]["note"] = "📓 Engineering Log day — see the section above."
+    plan["Sun"]["note"] = "Rest, or catch up on anything left over from the week."
+    return plan
 
 # ----------------------------------------------------------------------
 # PAGE
@@ -372,6 +465,71 @@ st.markdown(
 )
 
 CURRENT_WEEK_ID = max(0, min(TOTAL_WEEKS - 1, (date.today() - START_DATE).days // 7))
+TODAY_ISO = date.today().isoformat()
+
+# ---- Today banner: did I touch the roadmap today, and did I commit to
+#      GitHub today? Checked live every time the app is opened. ----
+progressed_today = any(w["last_touched"] == TODAY_ISO for w in state["weeks"].values())
+push_dates = get_github_push_dates(GITHUB_USERNAME, GITHUB_TOKEN)
+with st.container(border=True):
+    bcols = st.columns(3)
+    with bcols[0]:
+        st.markdown(f"**📅 Today — {date.today().strftime('%A, %b %d')}**")
+    with bcols[1]:
+        st.markdown("🟢 Roadmap progress logged" if progressed_today else "⚪ No roadmap activity yet today")
+    with bcols[2]:
+        if push_dates is None:
+            st.markdown(f"❓ Couldn't reach GitHub for `{GITHUB_USERNAME}`")
+        elif TODAY_ISO in push_dates:
+            st.markdown(f"🟢 Committed today · streak: {compute_streak(push_dates)} day(s)")
+        else:
+            st.markdown("🔴 No commits yet today")
+    if push_dates is None:
+        st.caption("GitHub check failed — rate-limited, username wrong, or offline. "
+                   "Add `GITHUB_TOKEN` to secrets for private-repo commits to count too.")
+
+# ---- Engineering Log: a private weekly write-up (what broke, how you
+#      fixed it, what you built), stored alongside your roadmap data and
+#      downloadable as one Markdown file any time. ----
+_d = date.today()
+current_saturday = _d - timedelta(days=(_d.weekday() - 5) % 7)  # most recent Saturday (today, if today is one)
+sat_iso = current_saturday.isoformat()
+log = state.setdefault("engineering_log", {})
+
+with st.expander(f"📓 Engineering Log — week of {current_saturday.strftime('%b %d, %Y')}", expanded=False):
+    entry = log.get(sat_iso, {"went_wrong": "", "how_fixed": "", "what_built": ""})
+    went_wrong = st.text_area("What went wrong this week? (errors, bugs, mathematical confusion)",
+                               value=entry["went_wrong"], key=f"log_wrong_{sat_iso}")
+    how_fixed = st.text_area("How did you fix or unblock it?",
+                              value=entry["how_fixed"], key=f"log_fixed_{sat_iso}")
+    what_built = st.text_area("What did you successfully build?",
+                               value=entry["what_built"], key=f"log_built_{sat_iso}")
+    if st.button("Save this week's log entry", key="save_log"):
+        log[sat_iso] = {"went_wrong": went_wrong, "how_fixed": how_fixed, "what_built": what_built}
+        save_state(state)
+        st.success("Saved.")
+
+    past = sorted((k for k in log if k != sat_iso), reverse=True)
+    if past:
+        st.markdown("---")
+        st.caption("Past entries")
+        for k in past:
+            e = log[k]
+            with st.expander(k, expanded=False):
+                st.markdown(f"**What went wrong:** {e['went_wrong'] or '_(blank)_'}")
+                st.markdown(f"**How you fixed it:** {e['how_fixed'] or '_(blank)_'}")
+                st.markdown(f"**What you built:** {e['what_built'] or '_(blank)_'}")
+
+    if log:
+        md_lines = ["# CHEF_P — Engineering Log\n"]
+        for k in sorted(log, reverse=True):
+            e = log[k]
+            md_lines.append(f"## Week of {k}\n")
+            md_lines.append(f"**What went wrong:** {e['went_wrong'] or '_(blank)_'}\n")
+            md_lines.append(f"**How you fixed it:** {e['how_fixed'] or '_(blank)_'}\n")
+            md_lines.append(f"**What you built:** {e['what_built'] or '_(blank)_'}\n")
+        st.download_button("⬇ Download full log as Markdown", "\n".join(md_lines),
+                            file_name="chefp_engineering_log.md", mime="text/markdown")
 
 # ---- single source of truth for "what's open right now" is the URL's
 #      ?week= param, not st.tabs (tabs reset on a real page navigation,
@@ -435,6 +593,7 @@ topic_total = next(c for t, c in topics if t == topic_label)
 weeks_of_topic = [w["id"] for w in ALL_WEEKS if w["phase"] == phase_name and w["topic"] == topic_label]
 week_in_topic = weeks_of_topic.index(wid) + 1
 
+week_resources = WEEK_RESOURCES.get(week_focus, [])
 col1, col2 = st.columns([2, 1])
 with col1:
     st.markdown(
@@ -447,6 +606,30 @@ with col1:
     st.caption(f"{topic_label} — part {week_in_topic} of {topic_total}")
     st.markdown(f"## {week_focus}")
     st.markdown(" &nbsp;·&nbsp; ".join(f"`{c}`" for c in week_concepts))
+
+    # ---- Daily study plan: this week's concepts + resources, pre-split
+    #      across the 7 days so there's no daily "what do I study?" delay.
+    #      Nothing is fragmented — each resource lands on exactly one day. ----
+    with st.expander("📅 This week's daily study plan", expanded=(wid == CURRENT_WEEK_ID)):
+        daily_plan = build_daily_plan(week_concepts, week_resources)
+        today_label = date.today().strftime("%a") if wid == CURRENT_WEEK_ID else None
+        for d, slot in daily_plan.items():
+            is_today = d == today_label
+            head = f"**{'👉 ' if is_today else ''}{d}"
+            head += f" — {slot['concept']}**" if slot["concept"] else "**"
+            st.markdown(head)
+            for rtype, label, url in slot["resources"]:
+                color = BADGE_COLORS.get(rtype, "#6b7280")
+                badge = (f"<span style='background:{color};color:#fff;font-size:.6rem;"
+                         f"font-weight:700;padding:1px 5px;border-radius:4px;margin-right:5px'>{rtype}</span>")
+                if url:
+                    st.markdown(f"&nbsp;&nbsp;{badge}<a href='{url}' target='_blank'>{label}</a>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"&nbsp;&nbsp;{badge}{label}", unsafe_allow_html=True)
+            if slot.get("note"):
+                st.caption(slot["note"])
+            if not slot["resources"] and not slot.get("note"):
+                st.caption("Review / catch-up.")
 
     # ---- Learn with AI: free, hand-written lesson content — no API, no
     #      key, no cost. Written at the week-topic level; clicking a
@@ -480,6 +663,7 @@ with col1:
                          type="primary" if wk["status"] == s else "secondary",
                          width="stretch"):
                 wk["status"] = s
+                touch_week(wk)
                 save_state(state)
                 st.rerun()
 
@@ -488,6 +672,7 @@ with col1:
     if daily != wk["daily"] or capstone != wk["capstone"]:
         wk["daily"] = daily
         wk["capstone"] = capstone
+        touch_week(wk)
         save_state(state)
 
     st.write("**This week's days**")
@@ -501,11 +686,11 @@ with col1:
                 wk["days"][i] = checked
                 changed = True
     if changed:
+        touch_week(wk)
         save_state(state)
 
 with col2:
     st.write("**Attached resources**")
-    week_resources = WEEK_RESOURCES.get(week_focus, [])
     if not week_resources:
         st.caption("No resources attached to this week yet.")
     for group_title, group_types in RESOURCE_GROUPS:
