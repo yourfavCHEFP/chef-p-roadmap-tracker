@@ -23,7 +23,7 @@ import requests
 
 GITHUB_USERNAME = "yourfavCHEFP"
 TOTAL_WEEKS = 65
-START_DATE = date(2026, 10, 1)
+START_DATE = date(2026, 11, 1)
 
 
 def get_state():

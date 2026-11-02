@@ -3,11 +3,14 @@ CHEF_P Roadmap Tracker — Streamlit app
 Machine Learning -> MLOps -> AI Engineer -> Polish & Interview Prep
 65 weeks starting Oct 1, 2026.
 """
+import base64
+import io
 import json
 import os
 import re
 import urllib.parse
-from datetime import date, timedelta
+import zipfile
+from datetime import date, datetime, timedelta
 
 import requests
 import streamlit as st
@@ -15,6 +18,7 @@ import graphviz
 
 from roadmap_content import STATIC_CONTENT, TOPIC_ILLUSTRATIONS
 from resources_data import WEEK_RESOURCES
+from assignments_data import ASSIGNMENTS
 
 # ----------------------------------------------------------------------
 # PERSISTENCE BACKEND
@@ -98,7 +102,7 @@ def render_teach_lesson(week_focus, text):
 # ----------------------------------------------------------------------
 # DATA MODEL
 # ----------------------------------------------------------------------
-START_DATE = date(2026, 10, 1)
+START_DATE = date(2026, 11, 1)
 STATE_FILE = "chefp_state.json"
 
 PHASES = {
@@ -333,10 +337,82 @@ def save_state(state):
         json.dump(state, f)
 
 
+# ----------------------------------------------------------------------
+# ASSIGNMENT SUBMISSIONS STORAGE
+# Kept in its OWN row (Supabase) / file (local) so file uploads never make
+# the frequent roadmap saves (every checkbox click) heavy. Same table, no
+# new setup. Files are stored base64-encoded; 3 MB per file keeps it snappy
+# — put anything bigger on GitHub/Drive and submit the link instead.
+# ----------------------------------------------------------------------
+SUBMISSIONS_FILE = "chefp_submissions.json"
+_SUB_ROW_ID = "chefp_submissions"
+MAX_FILE_BYTES = 3 * 1024 * 1024
+SUBMIT_FILE_TYPES = ["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "md",
+                     "py", "ipynb", "csv", "json", "zip", "docx"]
+
+
+def load_submissions():
+    if USE_SUPABASE:
+        try:
+            res = _supabase.table("chefp_roadmap").select("data").eq("id", _SUB_ROW_ID).execute()
+            if res.data:
+                return res.data[0]["data"]
+        except Exception as e:
+            st.warning(f"Could not load submissions from Supabase ({e}).")
+        return {}
+    if os.path.exists(SUBMISSIONS_FILE):
+        try:
+            with open(SUBMISSIONS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_submissions(subs):
+    if USE_SUPABASE:
+        try:
+            _supabase.table("chefp_roadmap").upsert({"id": _SUB_ROW_ID, "data": subs}).execute()
+        except Exception as e:
+            st.warning(f"Could not save submissions to Supabase ({e}). Your last change may not have persisted.")
+        return
+    with open(SUBMISSIONS_FILE, "w") as f:
+        json.dump(subs, f)
+
+
+def build_submission_zip(sat_iso, week_label, week_sub, assign):
+    """One compiled package for the week: submission.md + every uploaded file."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        md = [f"# Assignment submission — week of {sat_iso}: {week_label}\n"]
+        if assign.get("deliverable"):
+            md.append(f"**Deliverable asked for:** {assign['deliverable']}\n")
+        if week_sub.get("submitted_at"):
+            md.append(f"**Submitted:** {week_sub['submitted_at']}\n")
+        for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]:
+            e = week_sub.get("days", {}).get(d, {})
+            md.append(f"\n## {d}\n")
+            md.append(f"**Assignment:** {assign.get('tasks', {}).get(d, '')}\n")
+            md.append(f"**Write-up:**\n\n{e.get('text') or '_(blank)_'}\n")
+            md.append(f"**Link:** {e.get('link') or '_(none)_'}\n")
+            if e.get("files"):
+                md.append("**Files:**\n")
+                for fobj in e["files"]:
+                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(fobj["name"]))
+                    z.writestr(f"files/{d}_{safe}", base64.b64decode(fobj["b64"]))
+                    md.append(f"- files/{d}_{safe}\n")
+        z.writestr("submission.md", "\n".join(md))
+    return buf.getvalue()
+
+
 if "state" not in st.session_state:
     st.session_state.state = load_state()
 
 state = st.session_state.state
+
+if "subs" not in st.session_state:
+    st.session_state.subs = load_submissions()
+subs = st.session_state.subs
 
 # ----------------------------------------------------------------------
 # GITHUB COMMIT STREAK
@@ -417,7 +493,7 @@ def build_daily_plan(concepts, resources):
             plan[d]["resources"] = ordered[idx:idx + take]
             idx += take
 
-    plan["Sat"]["note"] = "📓 Engineering Log day — see the section above."
+    plan["Sat"]["note"] = "📓 Engineering Log + 📤 submit this week's assignments — both sections are at the top of the page."
     plan["Sun"]["note"] = "Rest, or catch up on anything left over from the week."
     return plan
 
@@ -531,6 +607,95 @@ with st.expander(f"📓 Engineering Log — week of {current_saturday.strftime('
         st.download_button("⬇ Download full log as Markdown", "\n".join(md_lines),
                             file_name="chefp_engineering_log.md", mime="text/markdown")
 
+# ---- Weekly Assignment Submission (Saturday): the 5 daily assignments for
+#      this calendar week, compiled in one place. Text + link + files/diagrams
+#      per day, each saved the moment you enter it. ----
+sub_wid = max(0, min(TOTAL_WEEKS - 1, (current_saturday - START_DATE).days // 7))
+sub_week = ALL_WEEKS[sub_wid]
+sub_assign = ASSIGNMENTS.get(sub_week["week_label"], {})
+week_sub = subs.setdefault(sat_iso, {"days": {}, "submitted_at": ""})
+week_sub.setdefault("days", {})
+upload_counters = st.session_state.setdefault("upload_counters", {})
+
+with st.expander(f"📤 Weekly Assignment Submission — Week {sub_wid + 1}: {sub_week['week_label']}", expanded=False):
+    if week_sub.get("submitted_at"):
+        st.success(f"✅ Submitted on {week_sub['submitted_at']} — you can still edit and re-submit.")
+    st.caption("Everything below saves automatically the moment you type, paste a link, or upload. "
+               "Diagrams: upload an image/PDF, or paste a link (Excalidraw, draw.io, Figma…). "
+               "Files over 3 MB: put them on GitHub/Drive and paste the link instead.")
+    if sub_assign.get("deliverable"):
+        st.info(f"**This week's deliverable:** {sub_assign['deliverable']}")
+
+    any_change = False
+    for d in ["Mon", "Tue", "Wed", "Thu", "Fri"]:
+        entry = week_sub["days"].setdefault(d, {"text": "", "link": "", "files": []})
+        entry.setdefault("files", [])
+        st.markdown(f"#### {d}")
+        st.markdown(f"📝 {sub_assign.get('tasks', {}).get(d, 'No assignment written for this day.')}")
+
+        text = st.text_area("Write-up / notes / answers", value=entry["text"],
+                            key=f"sub_text_{sat_iso}_{d}", height=100)
+        link = st.text_input("Link (repo, notebook, deployed app, diagram…)", value=entry["link"],
+                             key=f"sub_link_{sat_iso}_{d}")
+        if text != entry["text"] or link != entry["link"]:
+            entry["text"], entry["link"] = text, link
+            any_change = True
+
+        counter = upload_counters.get(f"{sat_iso}_{d}", 0)
+        uploaded = st.file_uploader("Upload files or diagrams", accept_multiple_files=True,
+                                    type=SUBMIT_FILE_TYPES, key=f"sub_up_{sat_iso}_{d}_{counter}")
+        if uploaded:
+            for f in uploaded:
+                data = f.getvalue()
+                if len(data) > MAX_FILE_BYTES:
+                    st.error(f"{f.name} is {len(data) / 1e6:.1f} MB — over the 3 MB limit. Submit it as a link instead.")
+                    continue
+                if any(x["name"] == f.name and x["size"] == len(data) for x in entry["files"]):
+                    continue
+                entry["files"].append({"name": f.name, "size": len(data),
+                                       "b64": base64.b64encode(data).decode()})
+                any_change = True
+            upload_counters[f"{sat_iso}_{d}"] = counter + 1  # resets the uploader after saving
+            touch_week(state["weeks"][str(sub_wid)])
+            save_state(state)
+            save_submissions(subs)
+            st.rerun()
+
+        for fi, fobj in enumerate(list(entry["files"])):
+            fc1, fc2, fc3 = st.columns([4, 1, 1])
+            fc1.markdown(f"📎 `{fobj['name']}` · {fobj['size'] / 1024:.0f} KB")
+            fc2.download_button("⬇", base64.b64decode(fobj["b64"]), file_name=fobj["name"],
+                                key=f"dl_{sat_iso}_{d}_{fi}")
+            if fc3.button("✕", key=f"rm_{sat_iso}_{d}_{fi}"):
+                entry["files"].pop(fi)
+                save_submissions(subs)
+                st.rerun()
+        st.divider()
+
+    if any_change:
+        touch_week(state["weeks"][str(sub_wid)])
+        save_state(state)
+        save_submissions(subs)
+
+    sc1, sc2 = st.columns(2)
+    if sc1.button("✅ Submit this week's assignments", key=f"submit_{sat_iso}", type="primary"):
+        week_sub["submitted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_submissions(subs)
+        st.rerun()
+    sc2.download_button("⬇ Download compiled week (.zip)",
+                        build_submission_zip(sat_iso, sub_week["week_label"], week_sub, sub_assign),
+                        file_name=f"chefp_week_{sat_iso}_submission.zip", mime="application/zip")
+
+    total_bytes = sum(f["size"] for w in subs.values() for dd in w.get("days", {}).values()
+                      for f in dd.get("files", []))
+    st.caption(f"Stored so far: {total_bytes / 1e6:.1f} MB of uploaded files across all weeks.")
+    if total_bytes > 15e6:
+        st.warning("You're past 15 MB of stored files — prefer links for large items to keep the app fast.")
+    past_subs = sorted((k for k in subs if k != sat_iso), reverse=True)
+    if past_subs:
+        st.markdown("**Past weeks:** " + " · ".join(
+            f"{'✅' if subs[k].get('submitted_at') else '⏳'} {k}" for k in past_subs))
+
 # ---- single source of truth for "what's open right now" is the URL's
 #      ?week= param, not st.tabs (tabs reset on a real page navigation,
 #      which is what clicking a diagram node causes) ----
@@ -626,10 +791,16 @@ with col1:
                     st.markdown(f"&nbsp;&nbsp;{badge}<a href='{url}' target='_blank'>{label}</a>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"&nbsp;&nbsp;{badge}{label}", unsafe_allow_html=True)
+            day_task = ASSIGNMENTS.get(week_focus, {}).get("tasks", {}).get(d)
+            if day_task:
+                st.markdown(f"&nbsp;&nbsp;📝 **Assignment:** {day_task}")
             if slot.get("note"):
                 st.caption(slot["note"])
-            if not slot["resources"] and not slot.get("note"):
+            if not slot["resources"] and not slot.get("note") and not day_task:
                 st.caption("Review / catch-up.")
+        deliverable = ASSIGNMENTS.get(week_focus, {}).get("deliverable")
+        if deliverable:
+            st.info(f"**Saturday deliverable:** {deliverable}")
 
     # ---- Learn with AI: free, hand-written lesson content — no API, no
     #      key, no cost. Written at the week-topic level; clicking a
