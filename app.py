@@ -304,37 +304,94 @@ def _fill_defaults(weeks):
     return weeks
 
 
+def _read_local(path):
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _write_local(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # a failed local backup must never crash the app
+
+
+def diagnose_supabase():
+    """Plain-English reason the cloud connection is failing + what to do.
+    Only runs after a failed load, so it costs nothing normally."""
+    from urllib.parse import urlparse
+    import socket
+    u = urlparse(str(SUPABASE_URL or ""))
+    host = u.hostname
+    if not u.scheme or not host:
+        return ("**What's wrong:** `SUPABASE_URL` isn't a valid web address. It must look like "
+                "`https://abcdefghijkl.supabase.co` — copy it from Supabase → Project Settings → API → "
+                "**Project URL** (check for a missing `https://`, stray spaces, or extra quotes).")
+    project_ref = host.split(".")[0]
+    if re.fullmatch(r"x{4,}|your[-_]?project.*|abcdefghijkl", project_ref):
+        return (f"**What's wrong:** `SUPABASE_URL` still has the placeholder value (`{host}`). Replace it with your "
+                "real **Project URL** from Supabase → Project Settings → API.")
+    try:
+        socket.getaddrinfo(host, 443)
+    except Exception:
+        return (f"**What's wrong:** this computer can't find `{host}` on the internet (DNS lookup failed). "
+                "Most likely, in this order:\n\n"
+                "1. **Typo in the project ID** inside `SUPABASE_URL` — compare it character by character with "
+                "Supabase → Project Settings → API → Project URL.\n"
+                "2. **The project is paused** (free projects pause after ~1 week idle) — open your Supabase "
+                "dashboard and click **Restore project**.\n"
+                "3. **Your network/DNS** is blocking it — try another network or turn any VPN off.\n\n"
+                f"**30-second test:** paste `{str(SUPABASE_URL).rstrip('/')}/rest/v1/` into your browser. A short JSON "
+                "message means the address is fine; \"site can't be reached\" means it's wrong or paused.")
+    try:
+        r = requests.get(str(SUPABASE_URL).rstrip("/") + "/rest/v1/chefp_roadmap",
+                         headers={"apikey": str(SUPABASE_KEY), "Authorization": f"Bearer {SUPABASE_KEY}"},
+                         params={"select": "id", "limit": "1"}, timeout=6)
+    except Exception as e:
+        return f"`{host}` resolves, but the request failed: `{e}`."
+    if r.status_code == 200:
+        return "The connection works now — press **Retry connection**."
+    if r.status_code in (401, 403):
+        return ("**What's wrong:** Supabase rejected the key. `SUPABASE_KEY` should be the **service_role** key "
+                "(Project Settings → API), pasted without quotes inside the quotes or extra spaces.")
+    if r.status_code == 404:
+        return ("**What's wrong:** the table doesn't exist yet. Run the SQL from `SUPABASE_SETUP.md` in Supabase's SQL Editor.")
+    return f"Supabase answered with HTTP {r.status_code}."
+
+
 def load_state():
+    """Cloud first; if the cloud can't be reached, fall back to the local
+    backup (never to a blank state), and remember the cloud is down so we
+    don't later overwrite good cloud data with stale/blank data."""
+    st.session_state.remote_ok = True
+    data = None
     if USE_SUPABASE:
-        weeks, log = {}, {}
         try:
             res = _supabase.table("chefp_roadmap").select("data").eq("id", _ROW_ID).execute()
-            if res.data:
-                weeks = res.data[0]["data"].get("weeks", {})
-                log = res.data[0]["data"].get("engineering_log", {})
+            data = res.data[0]["data"] if res.data else {}
+            _write_local(STATE_FILE, data)  # keep a fresh local backup
         except Exception as e:
-            st.warning(f"Could not load saved state from Supabase ({e}). Starting fresh this session.")
-        return {"weeks": _fill_defaults(weeks), "engineering_log": log}
-    # local JSON fallback
-    data = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
+            st.session_state.remote_ok = False
+            st.session_state.remote_error = str(e)
+    if data is None:
+        data = _read_local(STATE_FILE) or {}
     return {"weeks": _fill_defaults(data.get("weeks", {})), "engineering_log": data.get("engineering_log", {})}
 
 
 def save_state(state):
-    if USE_SUPABASE:
+    _write_local(STATE_FILE, state)  # local backup on EVERY save, no matter what
+    if USE_SUPABASE and st.session_state.get("remote_ok", True):
         try:
             _supabase.table("chefp_roadmap").upsert({"id": _ROW_ID, "data": state}).execute()
         except Exception as e:
-            st.warning(f"Could not save to Supabase ({e}). Your last change may not have persisted.")
-        return
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+            st.warning(f"Couldn't sync to Supabase just now ({e}). Your change is safe in the local backup "
+                       "and will sync on your next change.")
 
 
 # ----------------------------------------------------------------------
@@ -352,32 +409,27 @@ SUBMIT_FILE_TYPES = ["png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "txt", "
 
 
 def load_submissions():
-    if USE_SUPABASE:
+    data = None
+    if USE_SUPABASE and st.session_state.get("remote_ok", True):
         try:
             res = _supabase.table("chefp_roadmap").select("data").eq("id", _SUB_ROW_ID).execute()
-            if res.data:
-                return res.data[0]["data"]
+            data = res.data[0]["data"] if res.data else {}
+            _write_local(SUBMISSIONS_FILE, data)
         except Exception as e:
-            st.warning(f"Could not load submissions from Supabase ({e}).")
-        return {}
-    if os.path.exists(SUBMISSIONS_FILE):
-        try:
-            with open(SUBMISSIONS_FILE) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+            st.session_state.remote_ok = False
+            st.session_state.remote_error = str(e)
+    if data is None:
+        data = _read_local(SUBMISSIONS_FILE) or {}
+    return data
 
 
 def save_submissions(subs):
-    if USE_SUPABASE:
+    _write_local(SUBMISSIONS_FILE, subs)  # local backup on every save
+    if USE_SUPABASE and st.session_state.get("remote_ok", True):
         try:
             _supabase.table("chefp_roadmap").upsert({"id": _SUB_ROW_ID, "data": subs}).execute()
         except Exception as e:
-            st.warning(f"Could not save submissions to Supabase ({e}). Your last change may not have persisted.")
-        return
-    with open(SUBMISSIONS_FILE, "w") as f:
-        json.dump(subs, f)
+            st.warning(f"Couldn't sync submissions to Supabase just now ({e}). Safe in the local backup.")
 
 
 def build_submission_zip(sat_iso, week_label, week_sub, assign):
@@ -533,8 +585,24 @@ st.markdown(
 done_count = sum(1 for w in ALL_WEEKS if state["weeks"][str(w["id"])]["status"] == "done")
 st.progress(done_count / TOTAL_WEEKS)
 st.caption(f"{done_count}/{TOTAL_WEEKS} weeks marked Done ({round(100*done_count/TOTAL_WEEKS)}%)")
-st.caption("💾 Saving to Supabase (persists across restarts)" if USE_SUPABASE
-           else "⚠️ Saving to a local file only — will NOT survive a Streamlit Cloud restart. Add SUPABASE_URL/SUPABASE_KEY to secrets.")
+_remote_ok = st.session_state.get("remote_ok", True)
+if USE_SUPABASE and _remote_ok:
+    st.caption("💾 Saving to Supabase (persists across restarts) + a local backup copy")
+elif USE_SUPABASE:
+    st.caption("🔴 Supabase unreachable — saving to a local backup file only (cloud data is protected, not overwritten)")
+else:
+    st.caption("⚠️ Saving to a local file only — will NOT survive a Streamlit Cloud restart. Add SUPABASE_URL/SUPABASE_KEY to secrets.")
+
+if USE_SUPABASE and not _remote_ok:
+    with st.container(border=True):
+        st.error("☁️ Can't reach Supabase — your progress is NOT syncing to the cloud right now.")
+        st.markdown(diagnose_supabase())
+        st.caption("Meanwhile, everything you do is saved to a local backup file on this machine, and your existing "
+                   "cloud data is protected from being overwritten. Fix the cause above, then retry.")
+        if st.button("🔄 Retry connection", key="retry_supabase"):
+            for k in ("state", "subs", "remote_ok", "remote_error"):
+                st.session_state.pop(k, None)
+            st.rerun()
 st.markdown(
     "🟡 Pending &nbsp;&nbsp; 🟣 Learning &nbsp;&nbsp; 🟢 Done &nbsp;&nbsp; ⚪ Skip",
     unsafe_allow_html=True,
